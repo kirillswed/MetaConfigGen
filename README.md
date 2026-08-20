@@ -19,14 +19,15 @@ Notes from the real file:
 
 ## Setup
 
+Need only **curl** and **Python 3.10+**. Git is not required.
+
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
+curl -fsSL https://raw.githubusercontent.com/kirillswed/MetaConfigGen/main/install.sh -o install.sh && OPENROUTER_API_KEY=sk-or-... bash install.sh && cd MetaConfigGen && (source .venv/bin/activate || source .venv/Scripts/activate)
 ```
 
-Put your OpenRouter key in `.env`:
+The command downloads the installer, unpacks the repo zip, creates `.venv`, installs dependencies, writes `.env`, then activates the venv. If `.venv/bin/activate` is missing, Git Bash on Windows uses `.venv/Scripts/activate`.
+
+If the key was skipped, put it in `.env`:
 
 ```
 OPENROUTER_API_KEY=sk-or-...
