@@ -25,9 +25,8 @@ from validator import (
     validate_languages,
     validate_localizations,
     validate_output_workbook,
-    validate_source_text,
 )
-from wiki_client import WikiLookupError, is_random_command, lookup_product_pages, pick_random_product
+from wiki_client import WikiLookupError, lookup_random_pages_per_language
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,10 +47,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--geo",
         help="Region/country for Special Ad Category Country (D2), e.g. PE or Peru",
-    )
-    parser.add_argument(
-        "--product",
-        help="Product name to search on Wikipedia. Use random to pick a dish automatically.",
     )
     parser.add_argument(
         "--output",
@@ -81,18 +76,6 @@ def prompt_required(label: str) -> str:
     if not value:
         raise ValidationError(f"{label} cannot be empty")
     return value
-
-
-def collect_product(args: argparse.Namespace) -> tuple[str, bool]:
-    if args.product and args.product.strip():
-        raw = args.product.strip()
-    elif sys.stdin.isatty():
-        raw = prompt_required("Enter product name (or random)")
-    else:
-        raise ValidationError("Pass --product when running without an interactive terminal")
-    if is_random_command(raw):
-        return pick_random_product(), True
-    return raw, False
 
 
 def collect_region(args: argparse.Namespace) -> str:
@@ -149,30 +132,13 @@ def main(argv: list[str] | None = None) -> int:
         client = OpenRouterClient()
         languages = collect_languages(args)
         logger.info("Languages: %s", ", ".join(languages))
-        product, random_product = collect_product(args)
-        validate_source_text(product)
-        logger.info("Product: %s", product)
         region_input = collect_region(args)
         region_code = normalize_region_code(client.resolve_region_code(region_input))
         logger.info("Region: %s -> %s", region_input, region_code)
 
-        wiki_pages = None
-        last_error: Exception | None = None
-        attempts = 5 if random_product else 1
-        for attempt in range(1, attempts + 1):
-            try:
-                wiki_pages = lookup_product_pages(product, languages)
-                last_error = None
-                break
-            except WikiLookupError as exc:
-                last_error = exc
-                logger.warning("%s", exc)
-                if not random_product or attempt >= attempts:
-                    break
-                product = pick_random_product()
-                logger.info("Retrying with another random product: %s", product)
-        if wiki_pages is None:
-            raise last_error or WikiLookupError("Wikipedia lookup failed")
+        logger.info("Picking a random Wikipedia dish per language...")
+        wiki_pages = lookup_random_pages_per_language(languages)
+        product = "; ".join(f"{page.language}: {page.title}" for page in wiki_pages)
         wiki_payload = [
             {
                 "language": page.language,

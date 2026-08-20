@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from dataclasses import dataclass
+from functools import lru_cache
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-WIKI_USER_AGENT = "MetaAdsLocalizer/1.0 (local Excel helper; Wikipedia/Wikidata lookup)"
+WIKI_USER_AGENT = (
+    "MetaAdsLocalizer/1.0 (local Excel helper; contact via local CLI; "
+    "Wikipedia/Wikidata lookups)"
+)
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
+REQUEST_GAP_SECONDS = 0.5
+MAX_HTTP_RETRIES = 5
 
-# Meta Ads language names -> Wikipedia language codes
 LANGUAGE_TO_WIKI = {
     "afrikaans": "af",
     "albanian": "sq",
@@ -70,19 +76,22 @@ LANGUAGE_TO_WIKI = {
     "vietnamese": "vi",
 }
 
-
-class WikiLookupError(RuntimeError):
-    pass
-
-
-@dataclass
-class WikiPage:
-    language: str
-    wiki_code: str
-    title: str
-    extract: str
-    url: str
-
+DISH_CATEGORIES = {
+    "ar": ["تصنيف:أطباق"],
+    "de": ["Kategorie:Nationalgericht"],
+    "en": ["Category:National dishes", "Category:Street food"],
+    "es": ["Categoría:Platos"],
+    "fr": ["Catégorie:Plat"],
+    "it": ["Categoria:Piatti"],
+    "ja": ["Category:各国の料理"],
+    "ko": ["분류:나라별 요리"],
+    "pl": ["Kategoria:Potrawy narodowe"],
+    "pt": ["Categoria:Pratos"],
+    "ru": ["Категория:Национальные блюда"],
+    "tr": ["Kategori:Yemekler"],
+    "uk": ["Категорія:Національні страви"],
+    "zh": ["Category:各国菜肴"],
+}
 
 FALLBACK_PRODUCTS = [
     "Shawarma",
@@ -108,47 +117,36 @@ FALLBACK_PRODUCTS = [
 ]
 
 
+class WikiLookupError(RuntimeError):
+    pass
+
+
+@dataclass
+class WikiPage:
+    language: str
+    wiki_code: str
+    title: str
+    extract: str
+    url: str
+
+
+_SESSION: requests.Session | None = None
+_LAST_REQUEST_AT = 0.0
+
+
 def is_random_command(value: str) -> bool:
     return value.strip().lower() == "random"
 
 
-def pick_random_product() -> str:
-    titles = _category_product_titles()
-    pool = titles or FALLBACK_PRODUCTS
-    product = random.choice(pool)
-    logger.info("Random product: %s", product)
-    return product
-
-
-def _category_product_titles() -> list[str]:
-    titles: list[str] = []
-    try:
-        session = _session()
-        for category in ("Category:National dishes", "Category:Street food"):
-            response = session.get(
-                "https://en.wikipedia.org/w/api.php",
-                params={
-                    "action": "query",
-                    "list": "categorymembers",
-                    "cmtitle": category,
-                    "cmtype": "page",
-                    "cmlimit": 200,
-                    "format": "json",
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            members = (response.json().get("query") or {}).get("categorymembers") or []
-            for member in members:
-                title = str(member.get("title") or "").strip()
-                if not title or title.startswith("List of") or title.startswith("Category:"):
-                    continue
-                titles.append(title)
-    except requests.RequestException as exc:
-        logger.warning("Could not load Wikipedia food categories: %s", exc)
-        return []
-    unique = list(dict.fromkeys(titles))
-    return unique
+def lookup_random_pages_per_language(languages: list[str]) -> list[WikiPage]:
+    pages: list[WikiPage] = []
+    used_titles: set[str] = set()
+    for language in languages:
+        page = _random_page_for_language(language, used_titles)
+        used_titles.add(page.title.casefold())
+        logger.info("Random %s product: %s (%s)", language, page.title, page.url)
+        pages.append(page)
+    return pages
 
 
 def lookup_product_pages(product: str, languages: list[str]) -> list[WikiPage]:
@@ -157,25 +155,19 @@ def lookup_product_pages(product: str, languages: list[str]) -> list[WikiPage]:
         raise WikiLookupError("Product name is empty")
 
     logger.info("Searching Wikipedia/Wikidata for %r", query)
-    try:
-        entity_id = _search_wikidata_entity(query)
-        sitelinks = _entity_sitelinks(entity_id) if entity_id else {}
-        if entity_id:
-            logger.info("Wikidata entity: %s", entity_id)
-    except requests.RequestException as exc:
-        raise WikiLookupError(f"Wikidata request failed: {exc}") from exc
+    entity_id = _search_wikidata_entity(query)
+    sitelinks = _entity_sitelinks(entity_id) if entity_id else {}
+    if entity_id:
+        logger.info("Wikidata entity: %s", entity_id)
 
     pages: list[WikiPage] = []
     missing: list[str] = []
     for language in languages:
         wiki_code = wiki_code_for_language(language)
         page_title = sitelinks.get(f"{wiki_code}wiki")
-        try:
-            page = _fetch_page(wiki_code, language, page_title or query)
-        except requests.RequestException as exc:
-            raise WikiLookupError(
-                f"Wikipedia request failed for {language}: {exc}"
-            ) from exc
+        page = _fetch_page(wiki_code, language, page_title or query)
+        if page is None and page_title:
+            page = _fetch_page(wiki_code, language, query)
         if page is None:
             missing.append(f"{language} ({wiki_code}.wikipedia.org)")
             continue
@@ -183,9 +175,7 @@ def lookup_product_pages(product: str, languages: list[str]) -> list[WikiPage]:
         pages.append(page)
 
     if missing:
-        raise WikiLookupError(
-            "No Wikipedia article for: " + ", ".join(missing)
-        )
+        raise WikiLookupError("No Wikipedia article for: " + ", ".join(missing))
     return pages
 
 
@@ -198,16 +188,76 @@ def wiki_code_for_language(language: str) -> str:
     )
 
 
-def _session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"User-Agent": WIKI_USER_AGENT})
-    return session
+def _random_page_for_language(language: str, used_titles: set[str]) -> WikiPage:
+    wiki_code = wiki_code_for_language(language)
+    candidates = list(_category_titles(wiki_code)) or list(FALLBACK_PRODUCTS)
+    random.shuffle(candidates)
+    for title in candidates:
+        if title.casefold() in used_titles:
+            continue
+        page = _fetch_page(wiki_code, language, title)
+        if page is None:
+            hit = _search_title(wiki_code, title)
+            if hit:
+                page = _fetch_page(wiki_code, language, hit)
+        if page is not None:
+            return page
+    raise WikiLookupError(f"Could not find a random Wikipedia dish for {language}")
+
+
+@lru_cache(maxsize=32)
+def _category_titles(wiki_code: str) -> tuple[str, ...]:
+    titles: list[str] = []
+    for category in DISH_CATEGORIES.get(wiki_code, DISH_CATEGORIES["en"]):
+        try:
+            data = _api_get(
+                f"https://{wiki_code}.wikipedia.org/w/api.php",
+                {
+                    "action": "query",
+                    "list": "categorymembers",
+                    "cmtitle": category,
+                    "cmtype": "page",
+                    "cmlimit": 100,
+                    "format": "json",
+                },
+            )
+        except WikiLookupError as exc:
+            logger.warning("Category %s on %s failed: %s", category, wiki_code, exc)
+            continue
+        members = (data.get("query") or {}).get("categorymembers") or []
+        for member in members:
+            title = str(member.get("title") or "").strip()
+            if not title or title.startswith(("List of", "Lista", "Категория:", "Category:", "Categoría:")):
+                continue
+            titles.append(title)
+    unique = tuple(dict.fromkeys(titles))
+    if unique:
+        logger.info("Loaded %s dish pages from %s.wikipedia.org", len(unique), wiki_code)
+    return unique
+
+
+def _search_title(wiki_code: str, query: str) -> str | None:
+    data = _api_get(
+        f"https://{wiki_code}.wikipedia.org/w/api.php",
+        {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "srlimit": 1,
+            "srnamespace": 0,
+            "format": "json",
+        },
+    )
+    hits = (data.get("query") or {}).get("search") or []
+    if not hits:
+        return None
+    return str(hits[0].get("title") or "").strip() or None
 
 
 def _search_wikidata_entity(query: str) -> str | None:
-    response = _session().get(
+    data = _api_get(
         WIKIDATA_API,
-        params={
+        {
             "action": "wbsearchentities",
             "search": query,
             "language": "en",
@@ -215,28 +265,24 @@ def _search_wikidata_entity(query: str) -> str | None:
             "limit": 5,
             "format": "json",
         },
-        timeout=30,
     )
-    response.raise_for_status()
-    hits = response.json().get("search") or []
+    hits = data.get("search") or []
     if not hits:
         return None
     return str(hits[0]["id"])
 
 
 def _entity_sitelinks(entity_id: str) -> dict[str, str]:
-    response = _session().get(
+    data = _api_get(
         WIKIDATA_API,
-        params={
+        {
             "action": "wbgetentities",
             "ids": entity_id,
             "props": "sitelinks",
             "format": "json",
         },
-        timeout=30,
     )
-    response.raise_for_status()
-    entity = (response.json().get("entities") or {}).get(entity_id) or {}
+    entity = (data.get("entities") or {}).get(entity_id) or {}
     raw = entity.get("sitelinks") or {}
     titles: dict[str, str] = {}
     for site, payload in raw.items():
@@ -247,9 +293,9 @@ def _entity_sitelinks(entity_id: str) -> dict[str, str]:
 
 
 def _fetch_page(wiki_code: str, language: str, title: str) -> WikiPage | None:
-    response = _session().get(
+    data = _api_get(
         f"https://{wiki_code}.wikipedia.org/w/api.php",
-        params={
+        {
             "action": "query",
             "prop": "extracts|info",
             "exintro": 1,
@@ -259,10 +305,8 @@ def _fetch_page(wiki_code: str, language: str, title: str) -> WikiPage | None:
             "titles": title,
             "format": "json",
         },
-        timeout=30,
     )
-    response.raise_for_status()
-    pages = ((response.json().get("query") or {}).get("pages") or {}).values()
+    pages = ((data.get("query") or {}).get("pages") or {}).values()
     for page in pages:
         if page.get("missing") is not None:
             continue
@@ -279,6 +323,62 @@ def _fetch_page(wiki_code: str, language: str, title: str) -> WikiPage | None:
             url=url,
         )
     return None
+
+
+def _api_get(url: str, params: dict[str, str | int]) -> dict:
+    session = _session()
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_HTTP_RETRIES + 1):
+        _pace_requests()
+        try:
+            response = session.get(url, params=params, timeout=30)
+        except requests.RequestException as exc:
+            last_error = exc
+            time.sleep(min(2 ** attempt, 20))
+            continue
+        if response.status_code == 429:
+            wait_s = _retry_after_seconds(response, attempt)
+            logger.warning("Wikipedia/Wikidata 429, waiting %ss...", wait_s)
+            time.sleep(wait_s)
+            last_error = requests.HTTPError(f"429 Too Many Requests: {response.url}")
+            continue
+        if response.status_code in {500, 502, 503, 504}:
+            time.sleep(min(2 ** attempt, 20))
+            last_error = requests.HTTPError(f"{response.status_code}: {response.url}")
+            continue
+        if not response.ok:
+            raise WikiLookupError(f"Wikipedia HTTP {response.status_code}: {response.url}")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise WikiLookupError(f"Wikipedia returned invalid JSON: {exc}") from exc
+    raise WikiLookupError(f"Wikipedia request failed after retries: {last_error}")
+
+
+def _pace_requests() -> None:
+    global _LAST_REQUEST_AT
+    wait = REQUEST_GAP_SECONDS - (time.monotonic() - _LAST_REQUEST_AT)
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_REQUEST_AT = time.monotonic()
+
+
+def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
+    header = response.headers.get("Retry-After")
+    if header:
+        try:
+            return max(float(header), 1.0)
+        except ValueError:
+            pass
+    return min(2 ** attempt, 30)
+
+
+def _session() -> requests.Session:
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = requests.Session()
+        _SESSION.headers.update({"User-Agent": WIKI_USER_AGENT})
+    return _SESSION
 
 
 def _shorten_extract(text: str, max_len: int = 700) -> str:

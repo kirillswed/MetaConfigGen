@@ -38,7 +38,7 @@ The API key is never logged.
 
 ## Run
 
-Interactive run — the script asks for languages (if missing), product name, and region. Title, Body and Link come from Wikipedia; region is written to `Special Ad Category Country` (cell D2):
+Interactive run — the script asks for languages (if missing) and region. A random Wikipedia dish is chosen for each language. Region is written to `Special Ad Category Country` (cell D2):
 
 ```bash
 python main.py "example.xlsx" --languages языки здесь
@@ -47,20 +47,14 @@ python main.py "example.xlsx" --languages языки здесь
 Then it asks:
 
 ```
-Enter product name (or random):
-random
 Enter region:
 Турция
 ```
 
-If you type `random`, the script picks a random dish from Wikipedia. You can also pass `--product random`.
-
 Region names in any language are resolved by the model to an ISO country code and written to D2 (`TR` for Турция). Two-letter codes like `PE` are used as-is.
 
-Pass both explicitly:
-
 ```bash
-python main.py "example.xlsx" --languages языки здесь --product khachapuri --geo Peru
+python main.py "example.xlsx" --languages языки здесь --geo Peru
 ```
 
 The original file is copied to `*_backup.xlsx`. The result is written to `localized_result.xlsx` unless `--output` is set. The source file is not overwritten unless you pass `--overwrite`.
