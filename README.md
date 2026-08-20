@@ -39,7 +39,7 @@ The API key is never logged.
 
 ## Run
 
-Interactive run — the script asks for languages (if missing) and region. A random Wikipedia dish is chosen for each language. Region is written to `Special Ad Category Country` (cell D2):
+Interactive run — the script asks for languages (if missing) and region. A random **physical object** is generated for each language and taken from Wikipedia. Region is written to `Special Ad Category Country` (cell D2):
 
 ```bash
 python main.py "example.xlsx" --languages языки здесь

@@ -26,7 +26,7 @@ from validator import (
     validate_localizations,
     validate_output_workbook,
 )
-from wiki_client import WikiLookupError, lookup_random_pages_per_language
+from wiki_client import WikiLookupError, lookup_object_page
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,8 +136,16 @@ def main(argv: list[str] | None = None) -> int:
         region_code = normalize_region_code(client.resolve_region_code(region_input))
         logger.info("Region: %s -> %s", region_input, region_code)
 
-        logger.info("Picking a random Wikipedia dish per language...")
-        wiki_pages = lookup_random_pages_per_language(languages)
+        wiki_pages = []
+        used_names: set[str] = set()
+        for language in languages:
+            preferred = None
+            try:
+                preferred = client.generate_one_object(language, sorted(used_names))
+            except OpenRouterError as exc:
+                logger.warning("Object word for %s failed (%s); using fallback", language, exc)
+            page = lookup_object_page(language, preferred, used_names)
+            wiki_pages.append(page)
         product = "; ".join(f"{page.language}: {page.title}" for page in wiki_pages)
         wiki_payload = [
             {

@@ -15,8 +15,8 @@ WIKI_USER_AGENT = (
 )
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 REQUEST_GAP_SECONDS = 0.05
-MAX_HTTP_RETRIES = 3
-MAX_429_WAIT_SECONDS = 2.0
+MAX_HTTP_RETRIES = 10
+RATE_LIMIT_STEP_SECONDS = 2.0
 
 LANGUAGE_TO_WIKI = {
     "afrikaans": "af",
@@ -77,26 +77,46 @@ LANGUAGE_TO_WIKI = {
 }
 
 FALLBACK_PRODUCTS = [
-    "Shawarma",
-    "Khachapuri",
-    "Pizza",
-    "Sushi",
-    "Paella",
-    "Pho",
-    "Tacos",
-    "Borscht",
-    "Pad Thai",
-    "Ceviche",
-    "Falafel",
-    "Ramen",
-    "Moussaka",
-    "Poutine",
-    "Kimchi",
-    "Goulash",
-    "Empanada",
-    "Biryani",
-    "Feijoada",
-    "Bobotie",
+    "Hammer",
+    "Chair",
+    "Bicycle",
+    "Umbrella",
+    "Clock",
+    "Candle",
+    "Mirror",
+    "Camera",
+    "Guitar",
+    "Knife",
+    "Bottle",
+    "Spoon",
+    "Scissors",
+    "Pencil",
+    "Key",
+    "Wheel",
+    "Needle",
+    "Rope",
+    "Axe",
+    "Compass",
+    "Telescope",
+    "Helmet",
+    "Sword",
+    "Coin",
+    "Bell",
+    "Drum",
+    "Lamp",
+    "Backpack",
+    "Suitcase",
+    "Kettle",
+    "Shovel",
+    "Ladder",
+    "Anchor",
+    "Magnet",
+    "Battery",
+    "Binoculars",
+    "Typewriter",
+    "Flashlight",
+    "Wrench",
+    "Anvil",
 ]
 
 
@@ -121,17 +141,27 @@ def is_random_command(value: str) -> bool:
     return value.strip().lower() == "random"
 
 
-def lookup_random_pages_per_language(languages: list[str]) -> list[WikiPage]:
-    pages: list[WikiPage] = []
-    candidates = list(FALLBACK_PRODUCTS)
-    random.shuffle(candidates)
-    used_titles: set[str] = set()
-    for language in languages:
-        page = _random_page_for_language(language, candidates, used_titles)
-        used_titles.add(page.title.casefold())
-        logger.info("Random %s product: %s (%s)", language, page.title, page.url)
-        pages.append(page)
-    return pages
+def lookup_object_page(
+    language: str,
+    preferred: str | None,
+    used_names: set[str],
+) -> WikiPage:
+    extras = [item for item in FALLBACK_PRODUCTS if item.casefold() not in used_names]
+    random.shuffle(extras)
+    options: list[str] = []
+    if preferred and preferred.casefold() not in used_names:
+        options.append(preferred.strip())
+    options.extend(extras)
+    wiki_code = wiki_code_for_language(language)
+    for name in options:
+        page = _resolve_page(wiki_code, language, name)
+        if page is None:
+            continue
+        used_names.add(name.casefold())
+        used_names.add(page.title.casefold())
+        logger.info("Random %s object: %s (%s)", language, page.title, page.url)
+        return page
+    raise WikiLookupError(f"Could not find a random Wikipedia object for {language}")
 
 
 def lookup_product_pages(product: str, languages: list[str]) -> list[WikiPage]:
@@ -173,24 +203,40 @@ def wiki_code_for_language(language: str) -> str:
     )
 
 
-def _random_page_for_language(
-    language: str,
-    candidates: list[str],
-    used_titles: set[str],
-) -> WikiPage:
-    wiki_code = wiki_code_for_language(language)
-    tried = 0
-    for title in list(candidates):
-        if title.casefold() in used_titles:
-            continue
-        tried += 1
-        page = _fetch_page(wiki_code, language, title)
+def _resolve_page(wiki_code: str, language: str, title: str) -> WikiPage | None:
+    if wiki_code == "en":
+        return _fetch_page("en", language, title)
+    linked = _langlink_title(wiki_code, title)
+    if linked:
+        page = _fetch_page(wiki_code, language, linked)
         if page is not None:
-            candidates.remove(title)
             return page
-        if tried >= 4:
-            break
-    raise WikiLookupError(f"Could not find a random Wikipedia dish for {language}")
+    return _fetch_page(wiki_code, language, title)
+
+
+def _langlink_title(wiki_code: str, english_title: str) -> str | None:
+    if wiki_code == "en":
+        return None
+    data = _api_get(
+        "https://en.wikipedia.org/w/api.php",
+        {
+            "action": "query",
+            "prop": "langlinks",
+            "lllang": wiki_code,
+            "lllimit": 1,
+            "titles": english_title,
+            "redirects": 1,
+            "format": "json",
+        },
+    )
+    pages = ((data.get("query") or {}).get("pages") or {}).values()
+    for page in pages:
+        links = page.get("langlinks") or []
+        if not links:
+            continue
+        link = links[0]
+        return str(link.get("*") or link.get("title") or "").strip() or None
+    return None
 
 
 def _search_wikidata_entity(query: str) -> str | None:
@@ -273,16 +319,16 @@ def _api_get(url: str, params: dict[str, str | int]) -> dict:
             response = session.get(url, params=params, timeout=30)
         except requests.RequestException as exc:
             last_error = exc
-            time.sleep(min(2 ** attempt, 2))
+            time.sleep(_rate_limit_wait(attempt))
             continue
         if response.status_code == 429:
-            wait_s = _retry_after_seconds(response, attempt)
+            wait_s = _rate_limit_wait(attempt)
             logger.warning("Wikipedia/Wikidata 429, waiting %ss...", wait_s)
             time.sleep(wait_s)
             last_error = requests.HTTPError(f"429 Too Many Requests: {response.url}")
             continue
         if response.status_code in {500, 502, 503, 504}:
-            time.sleep(min(2 ** attempt, 2))
+            time.sleep(_rate_limit_wait(attempt))
             last_error = requests.HTTPError(f"{response.status_code}: {response.url}")
             continue
         if not response.ok:
@@ -302,15 +348,8 @@ def _pace_requests() -> None:
     _LAST_REQUEST_AT = time.monotonic()
 
 
-def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
-    header = response.headers.get("Retry-After")
-    wait_s = float(min(2 ** attempt, MAX_429_WAIT_SECONDS))
-    if header:
-        try:
-            wait_s = min(float(header), MAX_429_WAIT_SECONDS)
-        except ValueError:
-            pass
-    return max(wait_s, 0.2)
+def _rate_limit_wait(attempt: int) -> float:
+    return RATE_LIMIT_STEP_SECONDS * attempt
 
 
 def _session() -> requests.Session:
