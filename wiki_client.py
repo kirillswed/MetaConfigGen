@@ -4,7 +4,6 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from functools import lru_cache
 
 import requests
 
@@ -15,8 +14,9 @@ WIKI_USER_AGENT = (
     "Wikipedia/Wikidata lookups)"
 )
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
-REQUEST_GAP_SECONDS = 0.5
-MAX_HTTP_RETRIES = 5
+REQUEST_GAP_SECONDS = 0.05
+MAX_HTTP_RETRIES = 3
+MAX_429_WAIT_SECONDS = 2.0
 
 LANGUAGE_TO_WIKI = {
     "afrikaans": "af",
@@ -76,23 +76,6 @@ LANGUAGE_TO_WIKI = {
     "vietnamese": "vi",
 }
 
-DISH_CATEGORIES = {
-    "ar": ["تصنيف:أطباق"],
-    "de": ["Kategorie:Nationalgericht"],
-    "en": ["Category:National dishes", "Category:Street food"],
-    "es": ["Categoría:Platos"],
-    "fr": ["Catégorie:Plat"],
-    "it": ["Categoria:Piatti"],
-    "ja": ["Category:各国の料理"],
-    "ko": ["분류:나라별 요리"],
-    "pl": ["Kategoria:Potrawy narodowe"],
-    "pt": ["Categoria:Pratos"],
-    "ru": ["Категория:Национальные блюда"],
-    "tr": ["Kategori:Yemekler"],
-    "uk": ["Категорія:Національні страви"],
-    "zh": ["Category:各国菜肴"],
-}
-
 FALLBACK_PRODUCTS = [
     "Shawarma",
     "Khachapuri",
@@ -140,9 +123,11 @@ def is_random_command(value: str) -> bool:
 
 def lookup_random_pages_per_language(languages: list[str]) -> list[WikiPage]:
     pages: list[WikiPage] = []
+    candidates = list(FALLBACK_PRODUCTS)
+    random.shuffle(candidates)
     used_titles: set[str] = set()
     for language in languages:
-        page = _random_page_for_language(language, used_titles)
+        page = _random_page_for_language(language, candidates, used_titles)
         used_titles.add(page.title.casefold())
         logger.info("Random %s product: %s (%s)", language, page.title, page.url)
         pages.append(page)
@@ -188,70 +173,24 @@ def wiki_code_for_language(language: str) -> str:
     )
 
 
-def _random_page_for_language(language: str, used_titles: set[str]) -> WikiPage:
+def _random_page_for_language(
+    language: str,
+    candidates: list[str],
+    used_titles: set[str],
+) -> WikiPage:
     wiki_code = wiki_code_for_language(language)
-    candidates = list(_category_titles(wiki_code)) or list(FALLBACK_PRODUCTS)
-    random.shuffle(candidates)
-    for title in candidates:
+    tried = 0
+    for title in list(candidates):
         if title.casefold() in used_titles:
             continue
+        tried += 1
         page = _fetch_page(wiki_code, language, title)
-        if page is None:
-            hit = _search_title(wiki_code, title)
-            if hit:
-                page = _fetch_page(wiki_code, language, hit)
         if page is not None:
+            candidates.remove(title)
             return page
+        if tried >= 4:
+            break
     raise WikiLookupError(f"Could not find a random Wikipedia dish for {language}")
-
-
-@lru_cache(maxsize=32)
-def _category_titles(wiki_code: str) -> tuple[str, ...]:
-    titles: list[str] = []
-    for category in DISH_CATEGORIES.get(wiki_code, DISH_CATEGORIES["en"]):
-        try:
-            data = _api_get(
-                f"https://{wiki_code}.wikipedia.org/w/api.php",
-                {
-                    "action": "query",
-                    "list": "categorymembers",
-                    "cmtitle": category,
-                    "cmtype": "page",
-                    "cmlimit": 100,
-                    "format": "json",
-                },
-            )
-        except WikiLookupError as exc:
-            logger.warning("Category %s on %s failed: %s", category, wiki_code, exc)
-            continue
-        members = (data.get("query") or {}).get("categorymembers") or []
-        for member in members:
-            title = str(member.get("title") or "").strip()
-            if not title or title.startswith(("List of", "Lista", "Категория:", "Category:", "Categoría:")):
-                continue
-            titles.append(title)
-    unique = tuple(dict.fromkeys(titles))
-    if unique:
-        logger.info("Loaded %s dish pages from %s.wikipedia.org", len(unique), wiki_code)
-    return unique
-
-
-def _search_title(wiki_code: str, query: str) -> str | None:
-    data = _api_get(
-        f"https://{wiki_code}.wikipedia.org/w/api.php",
-        {
-            "action": "query",
-            "list": "search",
-            "srsearch": query,
-            "srlimit": 1,
-            "srnamespace": 0,
-            "format": "json",
-        },
-    )
-    hits = (data.get("query") or {}).get("search") or []
-    if not hits:
-        return None
-    return str(hits[0].get("title") or "").strip() or None
 
 
 def _search_wikidata_entity(query: str) -> str | None:
@@ -334,7 +273,7 @@ def _api_get(url: str, params: dict[str, str | int]) -> dict:
             response = session.get(url, params=params, timeout=30)
         except requests.RequestException as exc:
             last_error = exc
-            time.sleep(min(2 ** attempt, 20))
+            time.sleep(min(2 ** attempt, 2))
             continue
         if response.status_code == 429:
             wait_s = _retry_after_seconds(response, attempt)
@@ -343,7 +282,7 @@ def _api_get(url: str, params: dict[str, str | int]) -> dict:
             last_error = requests.HTTPError(f"429 Too Many Requests: {response.url}")
             continue
         if response.status_code in {500, 502, 503, 504}:
-            time.sleep(min(2 ** attempt, 20))
+            time.sleep(min(2 ** attempt, 2))
             last_error = requests.HTTPError(f"{response.status_code}: {response.url}")
             continue
         if not response.ok:
@@ -365,12 +304,13 @@ def _pace_requests() -> None:
 
 def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
     header = response.headers.get("Retry-After")
+    wait_s = float(min(2 ** attempt, MAX_429_WAIT_SECONDS))
     if header:
         try:
-            return max(float(header), 1.0)
+            wait_s = min(float(header), MAX_429_WAIT_SECONDS)
         except ValueError:
             pass
-    return min(2 ** attempt, 30)
+    return max(wait_s, 0.2)
 
 
 def _session() -> requests.Session:
