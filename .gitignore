@@ -1,0 +1,11 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+_headers_dump.json
+_rows_dump.json
+*_backup.xlsx
+localized_result.xlsx
